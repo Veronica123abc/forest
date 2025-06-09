@@ -12,8 +12,17 @@ import argparse
 from tqdm import tqdm
 import json
 from sklearn.model_selection import train_test_split
-from collections import defaultdict
 import matplotlib.pyplot as plt
+
+# Use proper evaluation metrics
+try:
+    from torchmetrics.detection import MeanAveragePrecision
+
+    TORCHMETRICS_AVAILABLE = True
+except ImportError:
+    TORCHMETRICS_AVAILABLE = False
+    print("Warning: torchmetrics not available. Install with: pip install torchmetrics")
+    print("Falling back to basic evaluation...")
 
 
 class DeadTreeDataset(torch.utils.data.Dataset):
@@ -131,176 +140,118 @@ def get_model(num_classes):
     return model
 
 
-def calculate_iou(box1, box2):
-    """Calculate Intersection over Union (IoU) of two bounding boxes"""
-    x1_max = max(box1[0], box2[0])
-    y1_max = max(box1[1], box2[1])
-    x2_min = min(box1[2], box2[2])
-    y2_min = min(box1[3], box2[3])
-
-    if x2_min <= x1_max or y2_min <= y1_max:
-        return 0.0
-
-    intersection = (x2_min - x1_max) * (y2_min - y1_max)
-    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    union = area1 + area2 - intersection
-
-    return intersection / union if union > 0 else 0.0
-
-
-def calculate_ap(gt_boxes, pred_boxes, pred_scores, iou_threshold=0.5):
-    """Calculate Average Precision for a single class"""
-    if len(gt_boxes) == 0 and len(pred_boxes) == 0:
-        return 1.0
-    if len(gt_boxes) == 0:
-        return 0.0
-    if len(pred_boxes) == 0:
-        return 0.0
-
-    # Sort predictions by confidence score (descending)
-    sorted_indices = np.argsort(pred_scores)[::-1]
-    pred_boxes = pred_boxes[sorted_indices]
-    pred_scores = pred_scores[sorted_indices]
-
-    # Track which ground truth boxes have been matched
-    gt_matched = np.zeros(len(gt_boxes), dtype=bool)
-
-    # Arrays to store precision and recall values
-    tp = np.zeros(len(pred_boxes))
-    fp = np.zeros(len(pred_boxes))
-
-    for i, pred_box in enumerate(pred_boxes):
-        best_iou = 0
-        best_gt_idx = -1
-
-        # Find best matching ground truth box
-        for j, gt_box in enumerate(gt_boxes):
-            if gt_matched[j]:
-                continue
-            iou = calculate_iou(pred_box, gt_box)
-            if iou > best_iou:
-                best_iou = iou
-                best_gt_idx = j
-
-        # Check if prediction is correct
-        if best_iou >= iou_threshold and best_gt_idx != -1:
-            tp[i] = 1
-            gt_matched[best_gt_idx] = True
-        else:
-            fp[i] = 1
-
-    # Calculate cumulative precision and recall
-    tp_cumsum = np.cumsum(tp)
-    fp_cumsum = np.cumsum(fp)
-
-    recall = tp_cumsum / len(gt_boxes)
-    precision = tp_cumsum / (tp_cumsum + fp_cumsum + 1e-8)
-
-    # Calculate AP using the 11-point interpolation method
-    ap = 0.0
-    for t in np.arange(0, 1.1, 0.1):
-        if np.sum(recall >= t) == 0:
-            p = 0
-        else:
-            p = np.max(precision[recall >= t])
-        ap += p / 11.0
-
-    return ap
-
-
-def evaluate_model(model, data_loader, device, num_classes):
-    """Evaluate model and calculate mAP metrics"""
+def evaluate_model_with_torchmetrics(model, data_loader, device):
+    """Evaluate model using torchmetrics (recommended)"""
     model.eval()
 
-    # Collect all predictions and ground truths
-    all_predictions = defaultdict(list)
-    all_ground_truths = defaultdict(list)
+    # Initialize the metric
+    metric = MeanAveragePrecision(
+        box_format="xyxy",
+        iou_type="bbox",
+        iou_thresholds=None,  # Use default IoU thresholds [0.5:0.05:0.95]
+        rec_thresholds=None,  # Use default recall thresholds
+        max_detection_thresholds=[1, 10, 100],
+        class_metrics=True,  # Compute per-class metrics
+        sync_on_compute=True
+    )
 
     with torch.no_grad():
-        for images, targets in tqdm(data_loader, desc="Evaluating"):
+        for images, targets in tqdm(data_loader, desc="Evaluating with torchmetrics"):
             images = list(image.to(device) for image in images)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
             # Get predictions
             predictions = model(images)
 
-            # Process each image in the batch
-            for i, (pred, target) in enumerate(zip(predictions, targets)):
-                # Ground truth
-                gt_boxes = target['boxes'].cpu().numpy()
-                gt_labels = target['labels'].cpu().numpy()
+            # Convert predictions and targets to CPU for metric calculation
+            preds = []
+            targs = []
 
-                # Predictions
-                pred_boxes = pred['boxes'].cpu().numpy()
-                pred_scores = pred['scores'].cpu().numpy()
-                pred_labels = pred['labels'].cpu().numpy()
+            for pred, target in zip(predictions, targets):
+                pred_dict = {
+                    'boxes': pred['boxes'].cpu(),
+                    'scores': pred['scores'].cpu(),
+                    'labels': pred['labels'].cpu()
+                }
+                preds.append(pred_dict)
 
-                # Group by class
-                for class_id in range(1, num_classes):  # Skip background class
-                    # Ground truth for this class
-                    gt_mask = gt_labels == class_id
-                    class_gt_boxes = gt_boxes[gt_mask]
+                target_dict = {
+                    'boxes': target['boxes'].cpu(),
+                    'labels': target['labels'].cpu()
+                }
+                targs.append(target_dict)
 
-                    # Predictions for this class
-                    pred_mask = pred_labels == class_id
-                    class_pred_boxes = pred_boxes[pred_mask]
-                    class_pred_scores = pred_scores[pred_mask]
+            # Update metric
+            metric.update(preds, targs)
 
-                    all_ground_truths[class_id].append(class_gt_boxes)
-                    all_predictions[class_id].append({
-                        'boxes': class_pred_boxes,
-                        'scores': class_pred_scores
-                    })
+    # Compute final metrics
+    result = metric.compute()
 
-    # Calculate AP for each class
-    ap_results = {}
-    iou_thresholds = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
-
-    for class_id in range(1, num_classes):
-        class_aps = []
-
-        for iou_threshold in iou_thresholds:
-            # Combine all ground truths and predictions for this class
-            all_gt_boxes = []
-            all_pred_boxes = []
-            all_pred_scores = []
-
-            for gt_boxes_list, pred_dict in zip(all_ground_truths[class_id], all_predictions[class_id]):
-                if len(gt_boxes_list) > 0:
-                    all_gt_boxes.extend(gt_boxes_list)
-                if len(pred_dict['boxes']) > 0:
-                    all_pred_boxes.extend(pred_dict['boxes'])
-                    all_pred_scores.extend(pred_dict['scores'])
-
-            if len(all_gt_boxes) > 0 or len(all_pred_boxes) > 0:
-                all_gt_boxes = np.array(all_gt_boxes) if all_gt_boxes else np.array([]).reshape(0, 4)
-                all_pred_boxes = np.array(all_pred_boxes) if all_pred_boxes else np.array([]).reshape(0, 4)
-                all_pred_scores = np.array(all_pred_scores) if all_pred_scores else np.array([])
-
-                ap = calculate_ap(all_gt_boxes, all_pred_boxes, all_pred_scores, iou_threshold)
-                class_aps.append(ap)
-            else:
-                class_aps.append(0.0)
-
-        ap_results[class_id] = {
-            'AP@0.5': class_aps[0],
-            'AP@0.75': class_aps[5],
-            'AP@0.5:0.95': np.mean(class_aps)
-        }
-
-    # Calculate overall mAP
-    overall_metrics = {
-        'mAP@0.5': np.mean([ap_results[cid]['AP@0.5'] for cid in ap_results]),
-        'mAP@0.75': np.mean([ap_results[cid]['AP@0.75'] for cid in ap_results]),
-        'mAP@0.5:0.95': np.mean([ap_results[cid]['AP@0.5:0.95'] for cid in ap_results])
+    # Extract key metrics
+    metrics = {
+        'mAP': result['map'].item(),  # mAP@0.5:0.95
+        'mAP_50': result['map_50'].item(),  # mAP@0.5
+        'mAP_75': result['map_75'].item(),  # mAP@0.75
+        'mAP_small': result['map_small'].item(),  # mAP for small objects
+        'mAP_medium': result['map_medium'].item(),  # mAP for medium objects
+        'mAP_large': result['map_large'].item(),  # mAP for large objects
+        'mAR_1': result['mar_1'].item(),  # mAR with max 1 detection per image
+        'mAR_10': result['mar_10'].item(),  # mAR with max 10 detections per image
+        'mAR_100': result['mar_100'].item(),  # mAR with max 100 detections per image
     }
 
-    return overall_metrics, ap_results
+    # Add per-class metrics if available
+    if 'map_per_class' in result and result['map_per_class'] is not None:
+        for i, class_map in enumerate(result['map_per_class']):
+            if not torch.isnan(class_map):
+                metrics[f'mAP_class_{i + 1}'] = class_map.item()
+
+    return metrics, result
+
+
+def evaluate_model_basic(model, data_loader, device):
+    """Basic evaluation without torchmetrics (fallback)"""
+    model.eval()
+
+    total_loss = 0.0
+    num_batches = 0
+
+    with torch.no_grad():
+        for images, targets in tqdm(data_loader, desc="Basic evaluation"):
+            images = list(image.to(device) for image in images)
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+            # Get loss during evaluation (model returns loss dict when targets provided)
+            loss_dict = model(images, targets)
+            losses = sum(loss for loss in loss_dict.values())
+
+            total_loss += losses.item()
+            num_batches += 1
+
+    avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
+
+    # Return basic metrics
+    return {
+        'avg_loss': avg_loss,
+        'mAP': 0.0,  # Placeholder
+        'mAP_50': 0.0,  # Placeholder
+        'mAP_75': 0.0  # Placeholder
+    }, {}
+
+
+def evaluate_model(model, data_loader, device):
+    """Main evaluation function that chooses the best available method"""
+    if TORCHMETRICS_AVAILABLE:
+        return evaluate_model_with_torchmetrics(model, data_loader, device)
+    else:
+        return evaluate_model_basic(model, data_loader, device)
 
 
 def collate_fn(batch):
     return tuple(zip(*batch))
+
+
+def train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=50):
     model.train()
     running_loss = 0.0
 
@@ -345,6 +296,13 @@ def main():
                         help='Batch size for validation')
 
     args = parser.parse_args()
+
+    # Check if torchmetrics is available and inform user
+    if TORCHMETRICS_AVAILABLE:
+        print("✓ Using torchmetrics for comprehensive evaluation metrics")
+    else:
+        print("⚠ torchmetrics not available. Using basic evaluation.")
+        print("  Install torchmetrics for better metrics: pip install torchmetrics")
 
     # Set device
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -413,9 +371,9 @@ def main():
     training_history = {
         'epochs': [],
         'train_loss': [],
+        'val_mAP': [],
         'val_mAP_50': [],
-        'val_mAP_75': [],
-        'val_mAP_50_95': []
+        'val_mAP_75': []
     }
 
     best_mAP = 0.0
@@ -432,30 +390,35 @@ def main():
 
         # Validation
         print(f"\nRunning validation...")
-        val_metrics, class_metrics = evaluate_model(model, val_loader, device, args.num_classes)
+        val_metrics, detailed_results = evaluate_model(model, val_loader, device)
 
         # Print results
         print(f"\nEpoch {epoch + 1} Results:")
         print(f"  Training Loss: {avg_train_loss:.4f}")
-        print(f"  Validation mAP@0.5: {val_metrics['mAP@0.5']:.4f}")
-        print(f"  Validation mAP@0.75: {val_metrics['mAP@0.75']:.4f}")
-        print(f"  Validation mAP@0.5:0.95: {val_metrics['mAP@0.5:0.95']:.4f}")
 
-        # Print per-class metrics
-        for class_id, metrics in class_metrics.items():
-            print(f"  Class {class_id} - AP@0.5: {metrics['AP@0.5']:.4f}, "
-                  f"AP@0.75: {metrics['AP@0.75']:.4f}, "
-                  f"AP@0.5:0.95: {metrics['AP@0.5:0.95']:.4f}")
+        if TORCHMETRICS_AVAILABLE:
+            print(f"  Validation mAP@0.5:0.95: {val_metrics['mAP']:.4f}")
+            print(f"  Validation mAP@0.5: {val_metrics['mAP_50']:.4f}")
+            print(f"  Validation mAP@0.75: {val_metrics['mAP_75']:.4f}")
+            print(f"  Validation mAR@100: {val_metrics['mAR_100']:.4f}")
+
+            # Print per-class metrics if available
+            for key, value in val_metrics.items():
+                if key.startswith('mAP_class_'):
+                    class_id = key.split('_')[-1]
+                    print(f"  Class {class_id} mAP@0.5:0.95: {value:.4f}")
+        else:
+            print(f"  Validation Loss: {val_metrics['avg_loss']:.4f}")
 
         # Save training history
         training_history['epochs'].append(epoch + 1)
         training_history['train_loss'].append(avg_train_loss)
-        training_history['val_mAP_50'].append(val_metrics['mAP@0.5'])
-        training_history['val_mAP_75'].append(val_metrics['mAP@0.75'])
-        training_history['val_mAP_50_95'].append(val_metrics['mAP@0.5:0.95'])
+        training_history['val_mAP'].append(val_metrics.get('mAP', 0.0))
+        training_history['val_mAP_50'].append(val_metrics.get('mAP_50', 0.0))
+        training_history['val_mAP_75'].append(val_metrics.get('mAP_75', 0.0))
 
         # Save best model
-        current_mAP = val_metrics['mAP@0.5:0.95']
+        current_mAP = val_metrics.get('mAP', 0.0)
         if current_mAP > best_mAP:
             best_mAP = current_mAP
             best_model_path = args.save_model.replace('.pth', '_best.pth')
@@ -487,6 +450,7 @@ def main():
         'training_history': training_history,
         'best_mAP': best_mAP,
         'final_metrics': val_metrics,
+        'torchmetrics_used': TORCHMETRICS_AVAILABLE,
         'model_info': {
             'num_classes': args.num_classes,
             'architecture': 'fasterrcnn_resnet50_fpn',
@@ -502,10 +466,10 @@ def main():
 
     # Plot training curves
     try:
-        plt.figure(figsize=(15, 5))
+        plt.figure(figsize=(15, 10))
 
         # Plot 1: Training Loss
-        plt.subplot(1, 3, 1)
+        plt.subplot(2, 3, 1)
         plt.plot(training_history['epochs'], training_history['train_loss'], 'b-', label='Training Loss')
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
@@ -513,23 +477,58 @@ def main():
         plt.legend()
         plt.grid(True)
 
-        # Plot 2: Validation mAP@0.5
-        plt.subplot(1, 3, 2)
-        plt.plot(training_history['epochs'], training_history['val_mAP_50'], 'r-', label='mAP@0.5')
+        # Plot 2: Validation mAP@0.5:0.95
+        plt.subplot(2, 3, 2)
+        plt.plot(training_history['epochs'], training_history['val_mAP'], 'r-', label='mAP@0.5:0.95')
+        plt.xlabel('Epoch')
+        plt.ylabel('mAP@0.5:0.95')
+        plt.title('Validation mAP@0.5:0.95')
+        plt.legend()
+        plt.grid(True)
+
+        # Plot 3: Validation mAP@0.5
+        plt.subplot(2, 3, 3)
+        plt.plot(training_history['epochs'], training_history['val_mAP_50'], 'g-', label='mAP@0.5')
         plt.xlabel('Epoch')
         plt.ylabel('mAP@0.5')
         plt.title('Validation mAP@0.5')
         plt.legend()
         plt.grid(True)
 
-        # Plot 3: Validation mAP@0.5:0.95
-        plt.subplot(1, 3, 3)
-        plt.plot(training_history['epochs'], training_history['val_mAP_50_95'], 'g-', label='mAP@0.5:0.95')
+        # Plot 4: Validation mAP@0.75
+        plt.subplot(2, 3, 4)
+        plt.plot(training_history['epochs'], training_history['val_mAP_75'], 'm-', label='mAP@0.75')
         plt.xlabel('Epoch')
-        plt.ylabel('mAP@0.5:0.95')
-        plt.title('Validation mAP@0.5:0.95')
+        plt.ylabel('mAP@0.75')
+        plt.title('Validation mAP@0.75')
         plt.legend()
         plt.grid(True)
+
+        # Plot 5: Combined mAP metrics
+        plt.subplot(2, 3, 5)
+        plt.plot(training_history['epochs'], training_history['val_mAP'], 'r-', label='mAP@0.5:0.95')
+        plt.plot(training_history['epochs'], training_history['val_mAP_50'], 'g-', label='mAP@0.5')
+        plt.plot(training_history['epochs'], training_history['val_mAP_75'], 'm-', label='mAP@0.75')
+        plt.xlabel('Epoch')
+        plt.ylabel('mAP')
+        plt.title('All mAP Metrics')
+        plt.legend()
+        plt.grid(True)
+
+        # Plot 6: Learning curve overview
+        ax1 = plt.subplot(2, 3, 6)
+        ax1.plot(training_history['epochs'], training_history['train_loss'], 'b-', label='Train Loss')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Training Loss', color='b')
+        ax1.tick_params(axis='y', labelcolor='b')
+        ax1.grid(True)
+
+        ax2 = ax1.twinx()
+        ax2.plot(training_history['epochs'], training_history['val_mAP'], 'r-', label='Val mAP')
+        ax2.set_ylabel('Validation mAP', color='r')
+        ax2.tick_params(axis='y', labelcolor='r')
+
+        plt.title('Training Overview')
 
         plt.tight_layout()
         plt.savefig(args.save_model.replace('.pth', '_training_curves.png'), dpi=300, bbox_inches='tight')
