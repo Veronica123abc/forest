@@ -97,7 +97,7 @@ def get_tile_annotations(annotations, tile_x, tile_y, tile_width, tile_height, m
 
 
 def create_tiles(image_path, annotation_path, output_dir, tile_width=800, tile_height=1068,
-                 overlap=0.1, min_area_ratio=0.3):
+                 overlap=0.1, min_area_ratio=0.3, skip_empty_tiles=True):
     """Create tiles from a large image with corresponding annotations"""
 
     # Load image
@@ -118,12 +118,11 @@ def create_tiles(image_path, annotation_path, output_dir, tile_width=800, tile_h
     # Generate tiles
     for y in range(0, img_height - tile_height + 1, step_y):
         for x in range(0, img_width - tile_width + 1, step_x):
-            # Extract tile
-            tile = image.crop((x, y, x + tile_width, y + tile_height))
-
-            # Get annotations for this tile
             tile_annotations = get_tile_annotations(
                 annotations, x, y, tile_width, tile_height, min_area_ratio)
+            if len(tile_annotations) == 0 and skip_empty_tiles:
+                continue
+            tile = image.crop((x, y, x + tile_width, img_height))
 
             # Create tile filename
             tile_name = f"{base_name}_tile_{y // step_y:03d}_{x // step_x:03d}"
@@ -148,9 +147,11 @@ def create_tiles(image_path, annotation_path, output_dir, tile_width=800, tile_h
     for y in range(0, img_height - tile_height + 1, step_y):
         x = img_width - tile_width
         if x > 0 and x % step_x != 0:  # Only if not already covered
-            tile = image.crop((x, y, img_width, y + tile_height))
             tile_annotations = get_tile_annotations(
                 annotations, x, y, tile_width, tile_height, min_area_ratio)
+            if len(tile_annotations) == 0 and skip_empty_tiles:
+                continue
+            tile = image.crop((x, y, x + tile_width, img_height))
 
             tile_name = f"{base_name}_tile_{y // step_y:03d}_edge_right"
             tile_image_path = os.path.join(output_dir, f"{tile_name}.jpg")
@@ -170,9 +171,12 @@ def create_tiles(image_path, annotation_path, output_dir, tile_width=800, tile_h
     for x in range(0, img_width - tile_width + 1, step_x):
         y = img_height - tile_height
         if y > 0 and y % step_y != 0:  # Only if not already covered
-            tile = image.crop((x, y, x + tile_width, img_height))
+
             tile_annotations = get_tile_annotations(
                 annotations, x, y, tile_width, tile_height, min_area_ratio)
+            if len(tile_annotations) == 0 and skip_empty_tiles:
+                continue
+            tile = image.crop((x, y, x + tile_width, img_height))
 
             tile_name = f"{base_name}_tile_edge_bottom_{x // step_x:03d}"
             tile_image_path = os.path.join(output_dir, f"{tile_name}.jpg")
@@ -192,23 +196,28 @@ def create_tiles(image_path, annotation_path, output_dir, tile_width=800, tile_h
     x = img_width - tile_width
     y = img_height - tile_height
     if x > 0 and y > 0:
-        tile = image.crop((x, y, img_width, img_height))
+
         tile_annotations = get_tile_annotations(
             annotations, x, y, tile_width, tile_height, min_area_ratio)
 
-        tile_name = f"{base_name}_tile_edge_corner"
-        tile_image_path = os.path.join(output_dir, f"{tile_name}.jpg")
-        tile_annotation_path = os.path.join(output_dir, f"{tile_name}.txt")
+        if len(tile_annotations) > 0 or skip_empty_tiles:
+            tile = image.crop((x, y, img_width, img_height))
 
-        tile.save(tile_image_path, "JPEG", quality=95)
-        with open(tile_annotation_path, 'w') as f:
-            for ann in tile_annotations:
-                f.write(f"{ann['category']} {ann['center_x']:.6f} {ann['center_y']:.6f} "
-                        f"{ann['width']:.6f} {ann['height']:.6f}\n")
 
-        tiles_created += 1
-        if len(tile_annotations) > 0:
-            tiles_with_annotations += 1
+
+            tile_name = f"{base_name}_tile_edge_corner"
+            tile_image_path = os.path.join(output_dir, f"{tile_name}.jpg")
+            tile_annotation_path = os.path.join(output_dir, f"{tile_name}.txt")
+
+            tile.save(tile_image_path, "JPEG", quality=95)
+            with open(tile_annotation_path, 'w') as f:
+                for ann in tile_annotations:
+                    f.write(f"{ann['category']} {ann['center_x']:.6f} {ann['center_y']:.6f} "
+                            f"{ann['width']:.6f} {ann['height']:.6f}\n")
+
+            tiles_created += 1
+            if len(tile_annotations) > 0:
+                tiles_with_annotations += 1
 
     return tiles_created, tiles_with_annotations
 
